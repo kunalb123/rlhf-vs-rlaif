@@ -1,0 +1,51 @@
+model:
+  name: "gpt2-medium"
+  max_length: 128                 # up from 64; matches grpo.max_new_tokens
+
+training:
+  batch_size: 2                   # up from 1; used by SFT (LoRA keeps memory low)
+  gradient_accumulation_steps: 8  # down from 16; effective batch stays 16
+  learning_rate: 1.0e-4
+  warmup_steps: 50
+
+sft:
+  max_epochs: 3
+  eval_split: 0.1
+  early_stopping_patience: 2
+
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules: ["c_attn", "c_proj"]
+
+data:
+  dataset: "Anthropic/hh-rlhf"
+  num_samples: 5000               # up from 1000; used by SFT and reward model
+  grpo_num_samples: 1000          # separate cap for GRPO stages (keeps steps at ~1500)
+  max_prompt_length: 128
+  max_response_length: 128
+
+reward_model:
+  batch_size: 1                   # separate from training.batch_size; max_length=256 is memory-sensitive
+  num_epochs: 3
+  learning_rate: 2.0e-5
+  max_length: 256                 # restored from 128; needs to cover full prompt+completion
+
+grpo:
+  num_epochs: 3
+  learning_rate: 1.0e-6
+  batch_size: 2
+  gradient_accumulation_steps: 4  # effective batch = 8
+  num_generations: 4
+  max_new_tokens: 128             # up from 64; longer completions = better reward signal
+  temperature: 1.0                # up from 0.7; more diversity prevents zero-std collapse in RLAIF
+  kl_coef: 0.2
+  max_grad_norm: 1.0
+
+rlaif:
+  judge_model: "claude-sonnet-4-6"
+
+evaluation:
+  num_eval_samples: 100
+  output_dir: "results"

@@ -1,0 +1,9 @@
+.venv/
+checkpoints/
+results/
+logs/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+configs/smoke_test_config.yaml
