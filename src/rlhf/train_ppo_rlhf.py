@@ -29,6 +29,14 @@ def prepare_grpo_dataset(raw_dataset) -> Dataset:
     return Dataset.from_list(prompts)
 
 
+def _rep_rate(text: str, n: int = 4) -> float:
+    words = text.split()
+    if len(words) < n:
+        return 0.0
+    ngrams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return 1 - len(set(ngrams)) / len(ngrams)
+
+
 def build_reward_fn(reward_model, tokenizer, max_length: int):
     """Returns a reward function that scores prompt+completion pairs."""
     # Reward model stays on CPU to avoid OOM alongside the policy on MPS
@@ -46,8 +54,13 @@ def build_reward_fn(reward_model, tokenizer, max_length: int):
         )
         with torch.no_grad():
             scores = reward_model(**inputs).logits.squeeze(-1)
-        # Squash to (-1, 1) to match RLAIF's reward scale without amplifying noise
-        return torch.tanh(scores).tolist()
+        # Subtract repetition penalty before normalizing — discourages the reward
+        # hacking pattern of producing long repetitive "I'm not sure" completions.
+        rep_penalties = torch.tensor([_rep_rate(c) for c in completions])
+        scores = scores - 2.0 * rep_penalties
+        # Center then tanh so GPT-2's negative logits land near 0 where tanh has
+        # curvature, preserving within-group differences.
+        return torch.tanh(scores - scores.mean()).tolist()
 
     return reward_fn
 
@@ -75,6 +88,7 @@ def train_ppo_rlhf(config_path: str = "configs/training_config.yaml") -> None:
         per_device_train_batch_size=config["grpo"]["batch_size"],
         gradient_accumulation_steps=config["grpo"]["gradient_accumulation_steps"],
         learning_rate=config["grpo"]["learning_rate"],
+        warmup_steps=config["training"]["warmup_steps"],
         num_generations=config["grpo"]["num_generations"],
         max_completion_length=config["grpo"]["max_new_tokens"],
         temperature=config["grpo"]["temperature"],

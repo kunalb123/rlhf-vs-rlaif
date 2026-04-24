@@ -10,6 +10,7 @@ Run from project root:
 """
 
 import os
+import re
 
 import anthropic
 import torch
@@ -19,32 +20,55 @@ from trl import GRPOConfig, GRPOTrainer
 
 from src.utils import extract_prompt_and_response, get_device, load_config, load_hh_rlhf
 
-JUDGE_PROMPT = """\
-Evaluate this AI assistant response on two criteria:
-- Helpfulness: does it directly address the question with useful information?
-- Conciseness: is it appropriately brief without padding?
+RANK_PROMPT = """\
+Rank these {n} AI assistant responses to the same prompt from best to worst. \
+Prefer responses that are relevant and concise over verbose or repetitive ones.
 
 Prompt: {prompt}
-Response: {response}
 
-Reply with a single integer from 1 (poor) to 10 (excellent). No explanation."""
+{responses}
+
+Output ONLY comma-separated numbers, best first. No other text. \
+Example for 4 responses: 3,1,4,2"""
 
 
-def get_claude_score(client: anthropic.Anthropic, prompt: str, response: str, model: str) -> float:
+def _rank_group(
+    client: anthropic.Anthropic, prompt: str, completions: list[str], model: str
+) -> list[int] | None:
+    """Ask Claude to rank completions. Returns list where ranks[i] = rank of completion i (1=best)."""
+    n = len(completions)
+    if n == 1:
+        return None
+    responses_text = "\n\n".join(
+        f"Response {i + 1}: {c}" for i, c in enumerate(completions)
+    )
     try:
         msg = client.messages.create(
             model=model,
-            max_tokens=5,
+            max_tokens=20,
             messages=[
                 {
                     "role": "user",
-                    "content": JUDGE_PROMPT.format(prompt=prompt, response=response),
+                    "content": RANK_PROMPT.format(
+                        n=n, prompt=prompt, responses=responses_text
+                    ),
                 }
             ],
         )
-        return max(1.0, min(10.0, float(msg.content[0].text.strip())))
-    except Exception:
-        return 5.0  # neutral fallback on API error
+        text = msg.content[0].text.strip()
+        all_nums = [int(x) for x in re.findall(r'\b\d+\b', text) if 1 <= int(x) <= n]
+        seen: set[int] = set()
+        ranks = []
+        for x in all_nums:
+            if x not in seen:
+                seen.add(x)
+                ranks.append(x)
+        if len(ranks) != n or set(ranks) != set(range(1, n + 1)):
+            return None
+        return ranks
+    except Exception as e:
+        print(f"[RLAIF rank error] {type(e).__name__}: {e}")
+        return None
 
 
 def prepare_grpo_dataset(raw_dataset) -> Dataset:
@@ -57,16 +81,33 @@ def prepare_grpo_dataset(raw_dataset) -> Dataset:
 
 
 def build_reward_fn(judge_model: str):
-    """Returns a reward function that scores responses using the Claude API."""
+    """Returns a reward function that ranks completions per prompt using Claude."""
     client = anthropic.Anthropic()
 
     def reward_fn(prompts: list[str], completions: list[str], **kwargs) -> list[float]:
-        raw_scores = [
-            get_claude_score(client, p, c, judge_model)
-            for p, c in zip(prompts, completions)
-        ]
-        # Normalize Claude's 1-10 scale to roughly [-1, 1] for GRPO
-        return [(s - 5.5) / 4.5 for s in raw_scores]
+        # GRPO passes the same prompt repeated num_generations times.
+        # Group completions by prompt, rank within each group, then convert
+        # rank → reward so GRPO always sees non-zero within-group variance.
+        groups: dict[str, dict] = {}
+        prompt_order: list[str] = []
+        for i, (p, c) in enumerate(zip(prompts, completions)):
+            if p not in groups:
+                groups[p] = {"indices": [], "completions": []}
+                prompt_order.append(p)
+            groups[p]["indices"].append(i)
+            groups[p]["completions"].append(c)
+
+        rewards = [0.0] * len(completions)
+        for prompt in prompt_order:
+            group = groups[prompt]
+            n = len(group["completions"])
+            ranks = _rank_group(client, prompt, group["completions"], judge_model)
+            if ranks is None:
+                continue  # leave neutral 0.0 for this group
+            for pos, idx in enumerate(group["indices"]):
+                # rank 1 (best) → +1.0, rank n (worst) → -1.0, linearly spaced
+                rewards[idx] = 1.0 - 2.0 * (ranks[pos] - 1) / (n - 1)
+        return rewards
 
     return reward_fn
 
@@ -78,6 +119,16 @@ def train_ppo_rlaif(config_path: str = "configs/training_config.yaml") -> None:
     print(f"Device: {device}")
 
     judge_model = config["rlaif"]["judge_model"]
+
+    # Verify API connectivity before starting training
+    print("Testing Claude API connection...")
+    _test_client = anthropic.Anthropic()
+    _test_msg = _test_client.messages.create(
+        model=judge_model, max_tokens=5,
+        messages=[{"role": "user", "content": "Reply with the number 1."}]
+    )
+    print(f"API test OK: '{_test_msg.content[0].text.strip()}'")
+
     reward_fn = build_reward_fn(judge_model)
 
     tokenizer = AutoTokenizer.from_pretrained("checkpoints/sft/final")

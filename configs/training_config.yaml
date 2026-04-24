@@ -38,9 +38,9 @@ grpo:
   batch_size: 2
   gradient_accumulation_steps: 4  # effective batch = 8
   num_generations: 4
-  max_new_tokens: 128             # up from 64; longer completions = better reward signal
+  max_new_tokens: 64              # capped to limit length-based reward hacking
   temperature: 1.0                # up from 0.7; more diversity prevents zero-std collapse in RLAIF
-  kl_coef: 0.2
+  kl_coef: 0.3
   max_grad_norm: 1.0
 
 rlaif:
